@@ -284,6 +284,12 @@ class GPTModel(GPTPreTrainedModel):
         self.prenorm = getattr(config, 'prenorm', True)
         use_rms_norm = getattr(config, 'rms_norm', False)
         word_embed_proj_dim = getattr(config, 'word_embed_proj_dim', None)
+
+        # XXX
+        self.bmt = getattr(config, 'bmt', False)
+        self.prenorm_stack = getattr(config, 'prenorm_stack', False)
+        self.prenorm_std = getattr(config, 'prenorm_std', False)
+
         # For GPT-J, GPT-NeoX
         self.parallel_block = getattr(config, 'parallel_block', False)
 
@@ -331,6 +337,47 @@ class GPTModel(GPTPreTrainedModel):
                            initializer_range=config.initializer_range))
         self.tie_weights()
 
+    def bmt_replace(self):
+        if not self.bmt:
+            return
+
+        def forward(self, stack: torch.Tensor, mixer_subset=None, mixer_kwargs=None):
+            print(f"XXX forward using prenorm stack block")
+            hidden_states, residual = stack
+            hidden_states, residual = self._forward(hidden_states, residual, mixer_subset=mixer_subset, mixer_kwargs=mixer_kwargs)
+            return torch.stack([hidden_states, residual])
+
+        def forward2(self, hidden_states: torch.Tensor, residual = None,
+                     mixer_subset=None, mixer_kwargs=None):
+            r"""Pass the input through the encoder layer.
+
+            The standard block is: LN -> MHA -> Dropout -> Add -> LN -> MLP -> Dropout -> Add.
+            """
+            print(f"XXX forward using standard block")
+            residual = hidden_states
+
+            hidden_states = self.mixer(self.norm1(residual), **(mixer_kwargs if mixer_kwargs is not None else {}))
+            dropped = self.drop_path1(self.dropout1(hidden_states))
+            residual = (dropped + residual) if residual is not None else dropped
+
+            hidden_states = self.mlp(self.norm2(residual))
+            dropped = self.drop_path2(self.dropout2(hidden_states))
+            return (dropped + residual) if residual is not None else dropped
+
+        if self.prenorm_stack: # need prenorm = True
+            print(f"XXX replace prenorm_stack")
+            # following codes only support non-parallel block: Block
+            Block._forward = Block.forward
+            Block.forward = forward
+        elif self.prenorm_std:
+            print(f"XXX replace prenorm_std")
+            Block.forward = forward2
+
+        import bmtrain as bmt
+        blocks = [layer for layer in self.layers]
+        self.layers = bmt.TransformerBlockList(blocks)
+        print(f"XXX layers: {type(self.layers)}", flush=True)
+
     def tie_weights(self):
         if self.process_group is not None:
             sync_shared_params(self, self.process_group)
@@ -353,17 +400,32 @@ class GPTModel(GPTPreTrainedModel):
                         if self.process_group is not None and self.sequence_parallel else {})
         if inference_params is not None:
             mixer_kwargs['inference_params'] = inference_params
-        for layer in self.layers:
-            if self.prenorm:
-                if not self.parallel_block:
-                    hidden_states, residual = layer(hidden_states, residual,
-                                                    mixer_kwargs=mixer_kwargs)
+        print(f"XXX forward: bmt={self.bmt}, prenorm={self.prenorm}/{self.prenorm_std}, parallel_block={self.parallel_block}", flush=True)
+        if self.bmt:
+            if self.prenorm_stack:
+                # hidden_states, residual = layer(hidden_states, residual,
+                #                                 mixer_kwargs=mixer_kwargs)
+                if residual is None:
+                    residual = torch.zeros(hidden_states.shape, device=hidden_states.device)
+                hidden_states, residual = self.layers(torch.stack([hidden_states, residual]), None, mixer_kwargs)
+            elif self.prenorm:
+                if residual is None:
+                    residual = torch.zeros(hidden_states.shape, device=hidden_states.device)
+                hidden_states, residual = self.layers(hidden_states, residual, None, mixer_kwargs)
+            else:  # postnorm / prenorm_std
+                hidden_states = self.layers(hidden_states, None, None, mixer_kwargs)
+        else:
+            for layer in self.layers:
+                if self.prenorm:
+                    if not self.parallel_block:
+                        hidden_states, residual = layer(hidden_states, residual,
+                                                        mixer_kwargs=mixer_kwargs)
+                    else:
+                        hidden_states, hidden_states2, residual = layer(
+                            hidden_states, hidden_states2, residual, mixer_kwargs=mixer_kwargs
+                        )
                 else:
-                    hidden_states, hidden_states2, residual = layer(
-                        hidden_states, hidden_states2, residual, mixer_kwargs=mixer_kwargs
-                    )
-            else:
-                hidden_states = layer(hidden_states, mixer_kwargs=mixer_kwargs)
+                    hidden_states = layer(hidden_states, mixer_kwargs=mixer_kwargs)
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_f(hidden_states)
