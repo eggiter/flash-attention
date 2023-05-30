@@ -25,7 +25,7 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 @pytest.mark.parametrize('activation', [F.silu])
 # @pytest.mark.parametrize('dim', [1024, 4096])
 @pytest.mark.parametrize('dim', [1024])
-def test_mha_parallel(dim, activation, sequence_parallel, world_size, dtype):
+def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     rtol, atol = (3e-3, 1e-2) if dtype == torch.bfloat16 else (3e-3, 1e-3)
 
     if not torch.distributed.is_initialized():
@@ -43,15 +43,14 @@ def test_mha_parallel(dim, activation, sequence_parallel, world_size, dtype):
                        requires_grad=True)
     # We need to generate g here so that all processes get the same gradient,
     # as rank 0 will have an extra bias that changes the RNG.
-    # If we don't divide by batch_size, the gradient gets a bit too large.
-    g = torch.randn_like(x_pt) # / 32
+    g = torch.randn_like(x_pt)
     if sequence_parallel:
         x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
     else:
         x = x_pt.detach().clone().requires_grad_()
 
     model_pt = GatedMlp(dim, activation=activation, device=device, dtype=dtype)
-    partition_dim = model_pt.fc1.weight.shape[0] // world_size
+    partition_dim = model_pt.fc1.weight.shape[0] // 2 // world_size
     model = ParallelGatedMlp(dim, parallel_state.get_tensor_model_parallel_group(),
                         activation=activation,
                         sequence_parallel=sequence_parallel, device=device, dtype=dtype)
@@ -72,7 +71,6 @@ def test_mha_parallel(dim, activation, sequence_parallel, world_size, dtype):
             model.fc2.bias.copy_(model_pt.fc2.bias)
 
     out = model(x)
-    # out_pt = rearrange(model_pt(rearrange(x_pt, '(b s) d -> b s d', s=seqlen)), 'b s d -> (b s) d')
     out_pt = model_pt(x_pt)
     partition_batch_dim = seqlen // world_size
     assert torch.allclose(
@@ -91,25 +89,25 @@ def test_mha_parallel(dim, activation, sequence_parallel, world_size, dtype):
         x.grad,
         x_pt.grad[:, rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
         if sequence_parallel else x_pt.grad,
-        rtol=rtol, atol=atol / 100  # magnitude of x.grad is quite small
+        rtol=rtol, atol=atol
     )
     # The error for d_weight and d_bias is quite a bit higher
     assert torch.allclose(
         model.fc1.weight.grad,
-        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', three=2)[:, rank * partition_dim:(rank + 1) * partition_dim],
+        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:, rank * partition_dim:(rank + 1) * partition_dim],
                   'two o i -> (two o) i'),
-        rtol=rtol, atol=atol #* 10
+        rtol=rtol, atol=atol
     )
     assert torch.allclose(
         model.fc1.bias.grad,
-        rearrange(rearrange(model_pt.fc1.bias.grad, '(two o) -> two o', three=2)[:, rank * partition_dim:(rank + 1) * partition_dim],
+        rearrange(rearrange(model_pt.fc1.bias.grad, '(two o) -> two o', two=2)[:, rank * partition_dim:(rank + 1) * partition_dim],
                   'two o -> (two o)'),
-        rtol=rtol, atol=atol #* 5
+        rtol=rtol, atol=atol
     )
     assert torch.allclose(
         model.fc2.weight.grad,
         model_pt.fc2.weight.grad[:, rank * partition_dim:(rank + 1) * partition_dim],
-        rtol=rtol, atol=atol #* 10
+        rtol=rtol, atol=atol
     )
     if rank == 0:
-        assert torch.allclose(model.fc2.bias.grad, model_pt.fc2.bias.grad, rtol=rtol, atol=atol * 5)
+        assert torch.allclose(model.fc2.bias.grad, model_pt.fc2.bias.grad, rtol=rtol, atol=atol)
