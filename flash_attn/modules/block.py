@@ -121,11 +121,18 @@ class Block(nn.Module):
         """
         fused_add_norm_fn = (dropout_add_rms_norm if isinstance(self.norm1, RMSNorm)
                              else dropout_add_layer_norm)
+        mems = [torch.cuda.memory_allocated()]
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_path1(self.dropout1(hidden_states))
+                mems.append(torch.cuda.memory_allocated())
+                if torch.distributed.get_rank() == 0: print(f"BLOCK: after drop_path1: {mems[-1]-mems[-2]}, {mems}")
                 residual = (dropped + residual) if residual is not None else dropped
+                mems.append(torch.cuda.memory_allocated())
+                if torch.distributed.get_rank() == 0: print(f"BLOCK: after residual: {mems[-1]-mems[-2]}, {mems}")
                 hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
+                mems.append(torch.cuda.memory_allocated())
+                if torch.distributed.get_rank() == 0: print(f"BLOCK: after norm1: {mems[-1]-mems[-2]}, {mems}")
                 if self.residual_in_fp32:
                     residual = residual.to(torch.float32)
             else:
@@ -146,13 +153,21 @@ class Block(nn.Module):
             if mixer_subset is not None:
                 mixer_kwargs['mixer_subset'] = mixer_subset
             hidden_states = self.mixer(hidden_states, **mixer_kwargs)
+            mems.append(torch.cuda.memory_allocated())
+            if torch.distributed.get_rank() == 0: print(f"BLOCK: after mixer: {mems[-1]-mems[-2]}, {mems}")
             if mixer_subset is not None:
                 residual = residual[:, mixer_subset]
             if not isinstance(self.mlp, nn.Identity):
                 if not self.fused_dropout_add_ln:
                     dropped = self.drop_path2(self.dropout2(hidden_states))
+                    mems.append(torch.cuda.memory_allocated())
+                    if torch.distributed.get_rank() == 0: print(f"BLOCK: after drop_path2: {mems[-1]-mems[-2]}, {mems}")
                     residual = (dropped + residual) if residual is not None else dropped
+                    mems.append(torch.cuda.memory_allocated())
+                    if torch.distributed.get_rank() == 0: print(f"BLOCK: after residual: {mems[-1]-mems[-2]}, {mems}")
                     hidden_states = self.norm2(residual.to(dtype=self.norm2.weight.dtype))
+                    mems.append(torch.cuda.memory_allocated())
+                    if torch.distributed.get_rank() == 0: print(f"BLOCK: after norm2: {mems[-1]-mems[-2]}, {mems}")
                     if self.residual_in_fp32:
                         residual = residual.to(torch.float32)
                 else:
@@ -169,6 +184,8 @@ class Block(nn.Module):
                         rowscale=rowscale2, prenorm=True, residual_in_fp32=self.residual_in_fp32
                     )
                 hidden_states = self.mlp(hidden_states)
+                mems.append(torch.cuda.memory_allocated())
+                if torch.distributed.get_rank() == 0: print(f"BLOCK: after mlp: {mems[-1]-mems[-2]}, {mems}")
             return hidden_states, residual
         else:
             assert residual is None

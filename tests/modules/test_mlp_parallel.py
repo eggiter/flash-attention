@@ -98,6 +98,10 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                   'two o i -> (two o) i'),
         rtol=rtol, atol=atol
     )
+    ref = rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:, rank * partition_dim:(rank + 1) * partition_dim],
+                    'two o i -> (two o) i')
+    print(f'Output max diff: {(model.fc1.weight.grad - ref).abs().max().item()}')
+    print(f'Output mean diff: {(model.fc1.weight.grad - ref).abs().mean().item()}')
     assert torch.allclose(
         model.fc1.bias.grad,
         rearrange(rearrange(model_pt.fc1.bias.grad, '(two o) -> two o', two=2)[:, rank * partition_dim:(rank + 1) * partition_dim],

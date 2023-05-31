@@ -599,19 +599,28 @@ class ParallelMHA(nn.Module):
                 split x during sequence parallel, we split the batch * seqlen dimension
                 (in case batch is small).
         """
+        mems = [torch.cuda.memory_allocated()]
         qkv = self.Wqkv(x)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"MHA: after Wqkv: {mems[-1]-mems[-2]}, {mems}")
         if seqlen is None:
             qkv = rearrange(qkv, 'b s (three h d) -> b s three h d', three=3, d=self.head_dim)
         else:
             qkv = rearrange(qkv, '(b s) (three h d) -> b s three h d', s=seqlen, three=3,
                             d=self.head_dim)
         if inference_params is None:
+            mems.append(torch.cuda.memory_allocated())
+            if torch.distributed.get_rank() == 0: print(f"MHA: after rearrange: {mems[-1]-mems[-2]}, {mems}")
             if self.rotary_emb_dim > 0:
                 qkv = self.rotary_emb(qkv)
+            mems.append(torch.cuda.memory_allocated())
+            if torch.distributed.get_rank() == 0: print(f"MHA: after rotary_emb: {mems[-1]-mems[-2]}, {mems}")
             if not self.checkpointing:
                 context = self.inner_attn(qkv, **kwargs)
             else:
                 context = torch.utils.checkpoint.checkpoint(self.inner_attn, qkv, **kwargs)
+            mems.append(torch.cuda.memory_allocated())
+            if torch.distributed.get_rank() == 0: print(f"MHA: after inner_attn: {mems[-1]-mems[-2]}, {mems}")
         else:
             if (not inference_params.fused_ft_kernel) or inference_params.sequence_len_offset == 0:
                 if self.rotary_emb_dim > 0:
@@ -645,4 +654,6 @@ class ParallelMHA(nn.Module):
         else:
             context = rearrange(context, 'b s h d -> (b s) (h d)')
         out = self.out_proj(context)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"MHA: after out_proj: {mems[-1]-mems[-2]}, {mems}")
         return out

@@ -274,6 +274,11 @@ def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_resid
                 nn.init.normal_(p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layer))
 
 
+def create_custom_forward(module):
+    def custom_forward(*inputs):
+        return module(*inputs)
+    return custom_forward
+
 class GPTModel(GPTPreTrainedModel):
 
     def __init__(self, config: GPT2Config, process_group=None, device=None, dtype=None):
@@ -292,6 +297,7 @@ class GPTModel(GPTPreTrainedModel):
         self.prenorm = getattr(config, 'prenorm', True)
         use_rms_norm = getattr(config, 'rms_norm', False)
         word_embed_proj_dim = getattr(config, 'word_embed_proj_dim', None)
+        self.checkpointing = getattr(config, 'activation_checkpointing', False)
         # For GPT-J, GPT-NeoX
         self.parallel_block = getattr(config, 'parallel_block', False)
 
@@ -351,9 +357,13 @@ class GPTModel(GPTPreTrainedModel):
         # If using Tensor Parallel with sequence parallel, we combine the batch and the seqlen
         # dimensions so that we can split on it easily, in case of small batch size.
         # Only the attention layers need to know the seqlen.
+        mems = []
+        mems.append(torch.cuda.memory_allocated())
         embedding_kwargs = ({'combine_batch_seqlen_dim': True}
                             if self.process_group is not None and self.sequence_parallel else {})
         hidden_states = self.embeddings(input_ids, position_ids=position_ids, **embedding_kwargs)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after embeddings: {mems[-1]-mems[-2]}, {mems}")
         if self.parallel_block:
             hidden_states2 = None
         residual = None
@@ -364,24 +374,35 @@ class GPTModel(GPTPreTrainedModel):
         for layer in self.layers:
             if self.prenorm:
                 if not self.parallel_block:
-                    hidden_states, residual = layer(hidden_states, residual,
-                                                    mixer_kwargs=mixer_kwargs)
+                    if self.checkpointing:
+                        from flagai.mpu.random import checkpoint
+                        hidden_states, residual = checkpoint(create_custom_forward(layer), hidden_states, residual,
+                                                        mixer_kwargs=mixer_kwargs)
+                    else:
+                        hidden_states, residual = layer(hidden_states, residual,
+                                                        mixer_kwargs=mixer_kwargs)
                 else:
                     hidden_states, hidden_states2, residual = layer(
                         hidden_states, hidden_states2, residual, mixer_kwargs=mixer_kwargs
                     )
             else:
                 hidden_states = layer(hidden_states, mixer_kwargs=mixer_kwargs)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after layers: {mems[-1]-mems[-2]}, {mems}")
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_f(hidden_states)
                 if not self.parallel_block:
                     residual = (dropped + residual) if residual is not None else dropped
+                    mems.append(torch.cuda.memory_allocated())
+                    if torch.distributed.get_rank() == 0: print(f"XXX: after residual: {mems[-1]-mems[-2]}, {mems}")
                 else:
                     dropped2 = self.drop_f(hidden_states2)
                     residual = ((residual + dropped + dropped2)
                                 if residual is not None else dropped + dropped2)
                 hidden_states = self.ln_f(residual.to(dtype=self.ln_f.weight.dtype))
+                mems.append(torch.cuda.memory_allocated())
+                if torch.distributed.get_rank() == 0: print(f"XXX: after ln_f: {mems[-1]-mems[-2]}, {mems}")
             else:
                 # Set prenorm=False here since we don't need the residual
                 if not self.parallel_block:
@@ -454,19 +475,31 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             last_token_only: whether to return the logit for the last token only,
                 of shape (batch_size, vocab_size)
         """
+        mems = [torch.cuda.memory_allocated()]
         hidden_states = self.transformer(input_ids, position_ids=position_ids,
                                          inference_params=inference_params)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after transformer: {mems[-1]-mems[-2]}, {mems}")
         if last_token_only:
             hidden_states = hidden_states[:, -1]
         if self.project_out is not None:
             hidden_states = self.project_out(hidden_states)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after project_out: {mems[-1]-mems[-2]}, {mems}")
         lm_logits = self.lm_head(hidden_states)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after lm_head: {mems[-1]-mems[-2]}, {mems}")
         # During inference, we want the full logit for sampling
         if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
             lm_logits = rearrange(lm_logits, '(n b) ... d -> b ... (n d)', b=hidden_states.shape[0])
-        CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
-        return CausalLMOutput(logits=lm_logits)
+        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_labels = input_ids[..., 1:].contiguous()
+        loss = self.loss_fn(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1).long())
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"XXX: after loss: {mems[-1]-mems[-2]}, {mems}")
+        CausalLMOutput = namedtuple('CausalLMOutput', ['logits','loss'])
+        return CausalLMOutput(logits=lm_logits, loss=loss)
 
     def load_state_dict(self, state_dict, strict=True):
         # Remapping from our checkpoints that used a different ordering of layers in the block

@@ -25,9 +25,16 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
 
     def forward(self, x):
+        mems = [torch.cuda.memory_allocated()]
         y = self.fc1(x)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"FFN: after fc1: {mems[-1]-mems[-2]}, {mems}")
         y = self.activation(y)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"FFN: after activation: {mems[-1]-mems[-2]}, {mems}")
         y = self.fc2(y)
+        mems.append(torch.cuda.memory_allocated())
+        if torch.distributed.get_rank() == 0: print(f"FFN: after fc2: {mems[-1]-mems[-2]}, {mems}")
         return y if not self.return_residual else (y, x)
 
 
