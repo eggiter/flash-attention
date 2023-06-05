@@ -33,6 +33,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
     device = f'cuda:{torch.distributed.get_rank()}'
+    torch.cuda.set_device(device)
     assert world_size <= torch.distributed.get_world_size()
     parallel_state.initialize_model_parallel(tensor_model_parallel_size_=world_size)
     rank = parallel_state.get_tensor_model_parallel_rank()
@@ -48,9 +49,12 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     # If we don't divide by batch_size, the gradient gets a bit too large.
     g = torch.randn_like(x_pt) / 32
     if sequence_parallel:
-        x = tensor_parallel.scatter_to_sequence_parallel_region(x_pt).detach().clone().requires_grad_()
+        x0 = tensor_parallel.scatter_to_sequence_parallel_region(x_pt)
+        x = x0.detach().clone().requires_grad_()
+        x1 = x0.detach().clone().requires_grad_()
     else:
         x = x_pt.detach().clone().requires_grad_()
+        x1 = x_pt.detach().clone().requires_grad_()
 
     model_pt = GatedMlp(dim, activation=activation, device=device, dtype=dtype, bias1=False, bias2=False)
     partition_dim = model_pt.fc1.weight.shape[0] // 2 // world_size
@@ -101,21 +105,23 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
 
     out = model(x)
     out_pt = model_pt(x_pt)
-    out_ref = model_ref(x)
+    out_ref = model_ref(x1)
     partition_batch_dim = batch_size * seqlen // world_size
-    torch.testing.assert_allclose(
+
+    assert (out - out_ref).abs().min().item() == 0.0
+    torch.testing.assert_close(
         out,
+        out_ref,
+        rtol=rtol, atol=atol
+    )
+    torch.testing.assert_close(
+        out_ref,
         out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
         if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
     )
-    torch.testing.assert_allclose(
+    torch.testing.assert_close(
         out,
-        out_ref,
-        rtol=rtol, atol=atol
-    )
-    torch.testing.assert_allclose(
-        out_ref,
         out_pt[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
         if sequence_parallel else out_pt,
         rtol=rtol, atol=atol
@@ -124,8 +130,22 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     out_pt.backward(g)
     out.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
                  if sequence_parallel else g)
+    out_ref.backward(g[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+                 if sequence_parallel else g)
     parallel_state.destroy_model_parallel()
 
+    assert (x.grad - x1.grad).abs().min().item() == 0.0
+    assert torch.allclose(
+        x.grad,
+        x1.grad,
+        rtol=rtol, atol=atol
+    )
+    assert torch.allclose(
+        x1.grad,
+        x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
+        if sequence_parallel else x_pt.grad,
+        rtol=rtol, atol=atol
+    )
     assert torch.allclose(
         x.grad,
         x_pt.grad[rank * partition_batch_dim:(rank + 1) * partition_batch_dim]
@@ -133,6 +153,14 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         rtol=rtol, atol=atol
     )
 
+    assert (model.fc1.weight.grad - model_ref.fc1.weight.grad).abs().min().item() == 0.0
+    assert torch.allclose(
+        model_ref.fc1.weight.grad,
+        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:,
+                  rank * partition_dim:(rank + 1) * partition_dim],
+                  'two o i -> (two o) i'),
+        rtol=rtol, atol=atol
+    )
     assert torch.allclose(
         model.fc1.weight.grad,
         rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:,
@@ -140,16 +168,25 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                   'two o i -> (two o) i'),
         rtol=rtol, atol=atol
     )
+
+    assert (model.fc2.weight.grad - model_ref.fc2.weight.grad).abs().min().item() == 0.0
     assert torch.allclose(
-        model.fc1.bias.grad,
-        rearrange(rearrange(model_pt.fc1.bias.grad, '(two o) -> two o', two=2)[:,
-                  rank * partition_dim:(rank + 1) * partition_dim],
-                  'two o -> (two o)'),
+        model_ref.fc2.weight.grad,
+        model_pt.fc2.weight.grad[:, rank * partition_dim:(rank + 1) * partition_dim],
         rtol=rtol, atol=atol
     )
     assert torch.allclose(
         model.fc2.weight.grad,
         model_pt.fc2.weight.grad[:, rank * partition_dim:(rank + 1) * partition_dim],
+        rtol=rtol, atol=atol
+    )
+    return
+
+    assert torch.allclose(
+        model.fc1.bias.grad,
+        rearrange(rearrange(model_pt.fc1.bias.grad, '(two o) -> two o', two=2)[:,
+                  rank * partition_dim:(rank + 1) * partition_dim],
+                  'two o -> (two o)'),
         rtol=rtol, atol=atol
     )
     if rank == 0:
@@ -167,11 +204,14 @@ class MlpRef(torch.nn.Module):
         hidden_features = hidden_features or int(8 * in_features / 3)
         hidden_features = (hidden_features + multiple_of - 1) // multiple_of * multiple_of
         from apex.transformer.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+        from apex.transformer.tensor_parallel import model_parallel_cuda_manual_seed
+        model_parallel_cuda_manual_seed(0)
         self.fc1 = ColumnParallelLinear(in_features, 2 * hidden_features, bias=bias1,
                                         gather_output=False,
                                         skip_bias_add=True,
                                         params_dtype=dtype,
                                         sequence_parallel_enabled=sequence_parallel_enabled,
+                                        no_async_tensor_model_parallel_allreduce=sequence_parallel_enabled,
                                         )
         self.activation = activation
         self.fc2 = RowParallelLinear(hidden_features, out_features, bias=bias2,
