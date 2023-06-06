@@ -75,12 +75,12 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                       'two o i -> (two o) i')
         )
         model_ref.w3.weight.copy_(
-            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[0:,
+            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[0:1,
                       rank * partition_dim:(rank + 1) * partition_dim],
                       'two o i -> (two o) i')
         )
         model_ref.w1.weight.copy_(
-            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[1:,
+            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[1:2,
                       rank * partition_dim:(rank + 1) * partition_dim],
                       'two o i -> (two o) i')
         )
@@ -158,10 +158,19 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         rtol=rtol, atol=atol
     )
 
-    assert (model.fc1.weight.grad - model_ref.fc1.weight.grad).abs().max().item() == 0.0
+    w3, w1 = model.fc1.weight.grad.chunk(2, dim=-1)
+    assert (w3 - model_ref.w3.weight.grad).abs().max().item() == 0.0
+    assert (w1 - model_ref.w1.weight.grad).abs().max().item() == 0.0
     assert torch.allclose(
-        model_ref.fc1.weight.grad,
-        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:,
+        model_ref.w3.weight.grad,
+        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[0:1,
+                  rank * partition_dim:(rank + 1) * partition_dim],
+                  'two o i -> (two o) i'),
+        rtol=rtol, atol=atol
+    )
+    assert torch.allclose(
+        model_ref.w1.weight.grad,
+        rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[1:2,
                   rank * partition_dim:(rank + 1) * partition_dim],
                   'two o i -> (two o) i'),
         rtol=rtol, atol=atol
@@ -174,9 +183,9 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         rtol=rtol, atol=atol
     )
 
-    assert (model.fc2.weight.grad - model_ref.fc2.weight.grad).abs().max().item() == 0.0
+    assert (model.fc2.weight.grad - model_ref.w2.weight.grad).abs().max().item() == 0.0
     assert torch.allclose(
-        model_ref.fc2.weight.grad,
+        model_ref.w2.weight.grad,
         model_pt.fc2.weight.grad[:, rank * partition_dim:(rank + 1) * partition_dim],
         rtol=rtol, atol=atol
     )
@@ -240,7 +249,10 @@ class LLAMAForward(torch.nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(self.activation(self.w1(x)) * self.w3(x))
+        gate, _ = self.w1(x)
+        y, _ = self.w3(x)
+        y, _ = self.w2(self.activation(gate) * y)
+        return y
 
 
 class MlpRef(torch.nn.Module):
