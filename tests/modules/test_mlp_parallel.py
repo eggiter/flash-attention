@@ -28,7 +28,7 @@ is_sm8x = torch.cuda.get_device_capability('cuda')[0] >= 8
 def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     # NOTE: default (rtol, atol) for dtypes:
     # bfloat16: (1.6e-2, 1e-5); fp16: (1e-3, 1e-5)
-    rtol, atol = (3e-3, 3e-2) if dtype == torch.bfloat16 else (3e-3, 3e-3)
+    rtol, atol = (3e-3, 3e-2) if dtype == torch.bfloat16 else (1e-3, 5e-4)  # (3e-3, 3e-3)
 
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
@@ -62,7 +62,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                              activation=activation,
                              bias1=False, bias2=False,
                              sequence_parallel=sequence_parallel, device=device, dtype=dtype)
-    model_ref = MlpRef(dim,
+    model_ref = LLAMAForward(dim, 4*dim,
                        activation=activation,
                        bias1=False, bias2=False, device=device, dtype=dtype,
                        sequence_parallel_enabled=sequence_parallel,
@@ -74,8 +74,13 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                       rank * partition_dim:(rank + 1) * partition_dim],
                       'two o i -> (two o) i')
         )
-        model_ref.fc1.weight.copy_(
-            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[:,
+        model_ref.w3.weight.copy_(
+            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[0:,
+                      rank * partition_dim:(rank + 1) * partition_dim],
+                      'two o i -> (two o) i')
+        )
+        model_ref.w1.weight.copy_(
+            rearrange(rearrange(model_pt.fc1.weight, '(two o) i -> two o i', two=2)[1:,
                       rank * partition_dim:(rank + 1) * partition_dim],
                       'two o i -> (two o) i')
         )
@@ -94,7 +99,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         model.fc2.weight.copy_(
             model_pt.fc2.weight[:, rank * partition_dim:(rank + 1) * partition_dim]
         )
-        model_ref.fc2.weight.copy_(
+        model_ref.w2.weight.copy_(
             model_pt.fc2.weight[:, rank * partition_dim:(rank + 1) * partition_dim]
         )
         """
@@ -108,7 +113,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     out_ref = model_ref(x1)
     partition_batch_dim = batch_size * seqlen // world_size
 
-    assert (out - out_ref).abs().min().item() == 0.0
+    assert (out - out_ref).abs().max().item() == 0.0
     torch.testing.assert_close(
         out,
         out_ref,
@@ -134,7 +139,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
                  if sequence_parallel else g)
     parallel_state.destroy_model_parallel()
 
-    assert (x.grad - x1.grad).abs().min().item() == 0.0
+    assert (x.grad - x1.grad).abs().max().item() == 0.0
     assert torch.allclose(
         x.grad,
         x1.grad,
@@ -153,7 +158,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         rtol=rtol, atol=atol
     )
 
-    assert (model.fc1.weight.grad - model_ref.fc1.weight.grad).abs().min().item() == 0.0
+    assert (model.fc1.weight.grad - model_ref.fc1.weight.grad).abs().max().item() == 0.0
     assert torch.allclose(
         model_ref.fc1.weight.grad,
         rearrange(rearrange(model_pt.fc1.weight.grad, '(two o) i -> two o i', two=2)[:,
@@ -169,7 +174,7 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
         rtol=rtol, atol=atol
     )
 
-    assert (model.fc2.weight.grad - model_ref.fc2.weight.grad).abs().min().item() == 0.0
+    assert (model.fc2.weight.grad - model_ref.fc2.weight.grad).abs().max().item() == 0.0
     assert torch.allclose(
         model_ref.fc2.weight.grad,
         model_pt.fc2.weight.grad[:, rank * partition_dim:(rank + 1) * partition_dim],
@@ -191,6 +196,51 @@ def test_mlp_parallel(dim, activation, sequence_parallel, world_size, dtype):
     )
     if rank == 0:
         assert torch.allclose(model.fc2.bias.grad, model_pt.fc2.bias.grad, rtol=rtol, atol=atol)
+
+
+class LLAMAForward(torch.nn.Module):
+    def __init__(
+            self,
+            dim,
+            hidden_dim,
+            activation=F.sigmoid,
+            bias1=True, bias2=True,
+            multiple_of=256,
+            device=None, dtype=None, sequence_parallel_enabled=False,
+    ):
+        super().__init__()
+
+        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        self.activation = activation
+        from apex.transformer.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+        from apex.transformer.tensor_parallel import model_parallel_cuda_manual_seed
+        model_parallel_cuda_manual_seed(0)
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=bias1,
+            gather_output=False,
+            skip_bias_add=True,
+            params_dtype=dtype,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            no_async_tensor_model_parallel_allreduce=sequence_parallel_enabled,
+        )
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=bias2, input_is_parallel=True,
+            skip_bias_add=True,
+            params_dtype=dtype,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+        )
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=bias1,
+            gather_output=False,
+            skip_bias_add=True,
+            params_dtype=dtype,
+            sequence_parallel_enabled=sequence_parallel_enabled,
+            no_async_tensor_model_parallel_allreduce=sequence_parallel_enabled,
+        )
+
+    def forward(self, x):
+        return self.w2(self.activation(self.w1(x)) * self.w3(x))
 
 
 class MlpRef(torch.nn.Module):
